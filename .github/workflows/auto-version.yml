@@ -1,0 +1,54 @@
+name: Auto Version Tagging
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+jobs:
+  version-tag:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # Получаем всю историю коммитов для работы с тегами
+          repository: ${{github.repository}}  # Внешний приватный репозиторий
+          token: ${{ secrets.ACTIONS }}
+
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Get latest tag
+        id: get-tag
+        run: |
+          # Получаем последний тег или используем v0.1.0 по умолчанию
+          
+          LAST_TAG=$(git describe --tags --abbrev=0 --match="v*.*.*" || echo "v0.1.0")
+          
+          echo "last_tag=${LAST_TAG}" >> $GITHUB_OUTPUT
+          
+          # Разбираем версию на компоненты
+          VERSION=${LAST_TAG#v}
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+          
+          # Инкрементим версию (патч по умолчанию)
+          NEW_PATCH=$((PATCH + 1))
+          NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+          echo "new_tag=${NEW_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Create new tag
+        run: |
+          git tag ${{ steps.get-tag.outputs.new_tag }}
+          # git tag -f latest
+          #git push origin ${{ steps.get-tag.outputs.new_tag }} latest --force
+          git push origin ${{ steps.get-tag.outputs.new_tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACTIONS }}

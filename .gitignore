@@ -24,9 +24,19 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
-.env
+.*/
+!.github/
 
-# Editor/IDE
-# .idea/
-# .vscode/
+.*
+!.git*
+!.*.yaml
+
+# backups
+*.bak
+*.bak.*
+*.copy
+*.copy.*
+
+/*.md
+!/README*.md
+!/PROJECT*.md

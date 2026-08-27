@@ -1,0 +1,30 @@
+name: Check Commit Prefix
+
+on:
+  push:
+    # Исключите основные ветки, если там проверка не нужна
+    branches-ignore:
+      - main
+      - master
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check commit message prefix
+        run: |
+          BRANCH_NAME="${{ github.ref_name }}"
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          
+          PREFIX="[$BRANCH_NAME]"
+          
+          if [[ "$COMMIT_MSG" != "$PREFIX"* ]]; then
+            echo "Ошибка! Сообщение коммита должно начинаться с: $PREFIX"
+            echo "Текущее сообщение: $COMMIT_MSG"
+            exit 1
+          fi
