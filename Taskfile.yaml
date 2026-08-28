@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+tasks:
+  # ──────────────────────────────────────────────
+  # Help-заглушка
+  # ──────────────────────────────────────────────
+  default:
+    desc: Список доступных задач
+    # deps: [clean, install-deps] # Сначала очистит и установит зависимости
+    cmds:
+      - task --list
+    silent: true
+
+  # Универсальная задача для проверки/установки любой команды
+  ensure:
+    silent: true
+    internal: true
+    cmds:
+      - |
+        echo "Checking if '{{.CMD}}' is installed..."
+        if command -v {{.CMD}} >/dev/null 2>&1; then
+          echo "'{{.CMD}}' is already installed."
+        else
+          echo "'{{.CMD}}' not found. Installing..."
+          {{.INSTALL_CMD}}
+          echo "Installation of '{{.CMD}}' complete."
+        fi
+    vars:
+      # Значения по умолчанию (можно оставить пустыми)
+      CMD: '{{default "" .CMD}}'
+      INSTALL_CMD: '{{default "" .INSTALL_CMD}}'
+
+
+  install:
+    desc: Установка программ
+    cmds:
+      - task: install:lint
+
+
+  install:lint: ## Установка golangci-lint
+    cmds:
+      - task: ensure
+        vars:
+          CMD: golangci-lint
+          INSTALL_CMD: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+#.PHONY: lint
+  lint:
+    desc: Проверка кода линтером golangci
+    cmd: 'golangci-lint run --config=.golangci.pipeline.yaml'

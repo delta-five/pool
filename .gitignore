@@ -40,3 +40,5 @@ go.work.sum
 /*.md
 !/README*.md
 !/PROJECT*.md
+
+tmp/
