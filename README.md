@@ -10,13 +10,12 @@ go get github.com/delta-five/pool
 
 ## Возможности
 
-- Фиксированный пул воркеров с возможностью динамического изменения размера (`SetWorkers`)
+- Фиксированный пул воркеров с возможностью динамического изменения размера (`SetWorkersCount`)
 - Буферизированная очередь задач
 - Два режима отправки задачи: блокирующий (`Submit`) и неблокирующий (`TrySubmit`)
-- Обработка паник через `WithPanicHandler` — опция при отправке задачи
-- Graceful shutdown с ожиданием завершения очереди либо с отбрасыванием очереди
-- Ожидание полного завершения пула через `Done()`
-- Счётчики выполненных и выполняющихся задач
+- Паники внутри задач автоматически перехватываются воркером — пул не падает
+- Остановка пула через `Stop()` и ожидание полного завершения через `Done()`
+- Счётчики через `Statistic()`: обработанные задачи, активные воркеры, число пойманных паник
 
 ## Быстрый старт
 
@@ -24,14 +23,13 @@ go get github.com/delta-five/pool
 package main
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/delta-five/pool"
 )
 
 func main() {
-	// 4 воркера, очередь на 100 задач
+	// 4 воркера, очередь на 100 задач.
 	p, err := pool.NewPool(4, 100)
 	if err != nil {
 		panic(err)
@@ -39,222 +37,125 @@ func main() {
 
 	for i := range 10 {
 		n := i
-		err := p.Submit(pool.MakeTask(n, func() {
+		if err := p.Submit(func() {
 			fmt.Printf("выполняю задачу %d\n", n)
-		}))
-		if err != nil {
+		}); err != nil {
 			fmt.Println("отправка не удалась:", err)
 		}
 	}
 
-	// Ждём завершения всех задач в очереди и останавливаем пул.
-	if err := p.Shutdown(context.Background(), false); err != nil {
-		fmt.Println("shutdown:", err)
+	if err := p.Stop(); err != nil {
+		fmt.Println("stop:", err)
 	}
+	<-p.Done()
 }
 ```
 
 ## Создание пула
 
 ```go
-p, err := pool.NewPool(workersCount, taskQueueSize)
+p, err := pool.NewPool(workersCount, queueSize)
 ```
 
-- `workersCount` — количество воркеров (больше нуля)
-- `taskQueueSize` — размер очереди задач (больше нуля)
+- `workersCount` — количество воркеров (`>= 0`; `0` создаёт пул без воркеров — задачи будут копиться в очереди, пока число воркеров не увеличат через `SetWorkersCount`)
+- `queueSize` — размер буфера очереди задач (`>= 0`; `0` — небуферизированный канал, `Submit` будет ждать воркера, готового принять задачу напрямую)
 
-Возвращает ошибку `ErrWrongWorkersCount` или `ErrWrongTaskQueueSize` при некорректных аргументах.
+Оба аргумента должны быть неотрицательными, иначе возвращается ошибка. Ошибки создаются через `errors.New` при каждом вызове и не являются экспортируемыми сентинелами — сравнивать их можно только по тексту, не по идентичности или `errors.Is`.
 
 ## Задачи
 
-Задача реализует интерфейс `PoolTask`:
+Задача — это просто функция без аргументов и результата:
 
 ```go
-type PoolTask interface {
-	ID() any
-	Do()
-}
+type Task func()
 ```
 
-Задачу удобно создавать через обобщённую функцию `MakeTask`, которая принимает
-идентификатор и функцию выполнения:
-
 ```go
-err := p.Submit(pool.MakeTask("task-id", func() {
+err := p.Submit(func() {
 	// полезная работа
-}))
+})
 ```
 
 ### Обработка паник
 
-По умолчанию паника внутри задачи распространяется наружу и приводит к падению
-программы (crash-by-design). Чтобы паника не роняла процесс, передайте обработчик
-через опцию `WithPanicHandler` — воркер автоматически восстановит выполнение и
-продолжит обработку следующих задач:
-
-```go
-err := p.Submit(
-	pool.MakeTask("task-id", func() {
-		panic("что-то пошло не так")
-	}),
-	pool.WithPanicHandler(func(id any, recovered any) {
-		fmt.Printf("паника в задаче %v: %v\n", id, recovered)
-	}),
-)
-```
-
-Опция `WithPanicHandler` доступна как для `Submit`, так и для `TrySubmit`.
-Если обработчик не передан — поведение по умолчанию (crash-by-design).
-
-> **Важно:** сам обработчик не должен паниковать. Паника внутри обработчика
-> распространяется наружу и роняет процесс.
+Паника внутри задачи автоматически перехватывается воркером: сама задача считается завершённой (счётчик `TaskProcessed` увеличивается), а число пойманных паник доступно через `Statistic().PanicsCount`. Воркер не останавливается и продолжает обрабатывать следующие задачи. Настраиваемого обработчика паник в текущем API нет.
 
 ## Отправка задач
 
 ### Submit — блокирующая отправка
 
-`Submit` блокируется, если очередь заполнена, до появления свободного места либо
-до остановки пула:
+`Submit` блокируется, если очередь заполнена, до появления свободного места либо до остановки пула (`Stop`), после которой возвращает ошибку:
 
 ```go
 err := p.Submit(task)
 ```
 
-Опциональные настройки передаются через функциональные опции, например
-`WithPanicHandler`:
-
-```go
-err := p.Submit(task, pool.WithPanicHandler(func(id any, recovered any) {
-	log.Printf("паника в задаче %v: %v", id, recovered)
-}))
-```
-
 ### TrySubmit — неблокирующая отправка
 
-`TrySubmit` возвращает `ErrQueueFull`, если очередь заполнена:
+`TrySubmit` сразу возвращает ошибку, если очередь заполнена, а не ждёт освобождения места:
 
 ```go
 err := p.TrySubmit(task)
-if err == pool.ErrQueueFull {
-	// очередь заполнена
-}
 ```
 
 ## Изменение числа воркеров
 
 ```go
 // увеличить до 8 воркеров
-if err := p.SetWorkers(8); err != nil {
+if err := p.SetWorkersCount(8); err != nil {
 	// ...
 }
 
 // уменьшить до 2 воркеров
-if err := p.SetWorkers(2); err != nil {
+if err := p.SetWorkersCount(2); err != nil {
 	// ...
 }
-
-fmt.Println("текущее число воркеров:", p.Workers())
 ```
+
+Уменьшение числа воркеров выполняется асинхронно: лишние воркеры останавливаются по мере того, как освобождаются от текущей задачи, метод не ждёт этого завершения.
 
 ## Наблюдение за состоянием
 
 ```go
-fmt.Println("выполняется сейчас:", p.ExecutingTasks())
-fmt.Println("выполнено всего:", p.DoneTasks())
-fmt.Println("состояние активности:", p.IsActive())
+stat := p.Statistic()
+fmt.Println("обработано задач:", stat.TaskProcessed)
+fmt.Println("активных воркеров:", stat.WorkersActive)
+fmt.Println("поймано паник:", stat.PanicsCount)
 ```
+
+`Statistic()` — единственный способ узнать состояние пула; отдельных методов вроде `IsActive()` или `Workers()` в текущем API нет.
 
 ## Остановка пула
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-
-// forceWorkersStop = false: дождаться выполнения всех задач из очереди
-err := p.Shutdown(ctx, false)
+if err := p.Stop(); err != nil {
+	// пул уже был остановлен ранее
+}
 ```
 
-Либо, чтобы остановиться быстрее и отбросить необработанные задачи из очереди:
-
-```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-
-// forceWorkersStop = true: отбросить задачи из очереди
-err := p.Shutdown(ctx, true)
-```
-
-После остановки `Submit`/`TrySubmit` возвращают `ErrPoolIsNotActive`,
-повторный `Shutdown` — `ErrAlreadyShutdown`, а `SetWorkers` — `ErrPoolIsNotActive`.
+`Stop()` не принимает контекст или таймаут: он закрывает очередь задач и передаёт всем воркерам сигнал завершения сразу же. Повторный вызов `Stop()` возвращает ошибку. После остановки `Submit`, `TrySubmit` и `SetWorkersCount` также возвращают ошибку.
 
 ### Done — ожидание завершения пула
 
-`Done` возвращает канал, который закрывается, когда все воркеры завершили работу.
-Это полезно, если `Shutdown` превысил дедлайн контекста и вы хотите дождаться
-полной остановки асинхронно:
+`Done` возвращает канал, который закрывается, когда все воркеры фактически завершили работу:
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-
-if err := p.Shutdown(ctx, true); err != nil {
-	fmt.Println("shutdown превысил дедлайн, ждём в фоне:", err)
+if err := p.Stop(); err != nil {
+	fmt.Println("stop:", err)
 }
-
-// Дождаться полного завершения всех воркеров.
 <-p.Done()
 fmt.Println("пул полностью остановлен")
 ```
 
-## Полный пример
+## Известные ограничения
 
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"log"
-	"time"
-
-	"github.com/delta-five/pool"
-)
-
-func main() {
-	p, err := pool.NewPool(4, 100)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Отправляем 20 задач.
-	for i := range 20 {
-		if err := p.Submit(pool.MakeTask(i, func() {
-			fmt.Printf("задача %d стартовала\n", i)
-			time.Sleep(50 * time.Millisecond)
-			fmt.Printf("задача %d завершена\n", i)
-		})); err != nil {
-			log.Printf("submit %d: %v", i, err)
-		}
-	}
-
-	// Меняем число воркеров на лету.
-	if err := p.SetWorkers(8); err != nil {
-		log.Printf("SetWorkers: %v", err)
-	}
-
-	// Graceful shutdown: ждём выполнения всей очереди.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := p.Shutdown(ctx, false); err != nil {
-		log.Printf("shutdown: %v", err)
-	}
-
-	fmt.Printf("выполнено задач: %d\n", p.DoneTasks())
-}
-```
+- `Submit`/`TrySubmit`, вызванные из одной горутины одновременно со `Stop()` из другой, и уменьшение числа воркеров (`SetWorkersCount` на меньшее значение), выполняющееся одновременно со `Stop()`, могут в редких случаях привести к панике (`send on closed channel`) вместо корректного возврата ошибки — это гонка между чтением канала под блокировкой и его последующим закрытием в `Stop()`. Не вызывайте `Stop()` одновременно с активными отправками задач или изменением размера пула без внешней синхронизации.
+- Возвращаемый `Statistic()` тип (`poolStatistic`) неэкспортируемый: его поля доступны через `:=`, но объявить переменную этого типа явно (`var s pool.poolStatistic`) снаружи пакета нельзя.
 
 ## Тесты
 
 ```bash
 go test -race -cover ./...
 ```
+
+Отдельно от юнит-тестов, гонки выше задокументированы в review и не покрыты тестами намеренно — их детерминированное воспроизведение потребовало бы намеренно провоцировать падение процесса.
