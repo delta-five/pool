@@ -6,25 +6,17 @@ import (
 )
 
 // These stress tests race Submit/TrySubmit/SetWorkersCount against a
-// concurrent Stop() call. They pin two known, unfixed bugs:
-//
-//   - Submit, TrySubmit, SetWorkersCount and the internal killWorker all call
-//     p.submitWG.Add(1) unconditionally *before* checking p.stopCalled, with
-//     no synchronization preventing that Add from racing with Stop's
-//     p.submitWG.Wait() while the counter is transitioning through zero.
-//     That is exactly the misuse sync.WaitGroup's docs warn about ("Note
-//     that calls with a positive delta that start when the counter is zero
-//     must happen before a Wait"), and it is reproducible both as an
-//     explicit "sync: WaitGroup is reused before previous Wait has
-//     returned" panic and, in other interleavings, as a genuine data race on
-//     p.taskCh / p.workerCloseCh flagged by `go test -race` (Stop() writing
-//     `p.taskCh = nil` concurrently with Submit reading p.taskCh to build
-//     its select statement).
+// concurrent Stop() call. Submit, TrySubmit, SetWorkersCount and the
+// internal killWorker all check p.stopCalled and register with
+// p.submitWG.Add(1) in the same p.lock critical section that Stop() takes
+// (held for the whole of Stop(), including p.submitWG.Wait()), so an
+// in-flight call is always fully ordered before or fully ordered after
+// Stop() closes p.taskCh / p.workerCloseCh.
 //
 // Every goroutine below recovers its own panics so a hit doesn't crash the
 // whole test binary; a recovered panic is still reported via t.Errorf, so
-// these tests fail (rather than hang or silently pass) whenever the race
-// actually fires. Run with `-race` to also catch the data-race variant.
+// these tests fail (rather than hang or silently pass) if this synchronization
+// ever regresses. Run with `-race` to also catch data-race variants.
 func TestPool_ConcurrentSubmitAndTrySubmitVsStop(t *testing.T) {
 	const iterations = 3000
 	for range iterations {

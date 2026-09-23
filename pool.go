@@ -18,7 +18,7 @@ type Pool struct {
 	workersWG     sync.WaitGroup
 	submitWG      sync.WaitGroup
 	lock          sync.RWMutex
-	stopCalled    atomic.Bool
+	stopCalled    bool
 }
 
 type poolStatisticHolder struct {
@@ -68,12 +68,14 @@ func (p *Pool) addWorker() {
 }
 
 func (p *Pool) killWorker() bool {
-	p.submitWG.Add(1)
-	defer p.submitWG.Done()
-
-	if p.stopCalled.Load() {
+	p.lock.RLock()
+	if p.stopCalled {
+		p.lock.RUnlock()
 		return false
 	}
+	p.submitWG.Add(1)
+	p.lock.RUnlock()
+	defer p.submitWG.Done()
 
 	select {
 	case p.workerCloseCh <- struct{}{}:
@@ -86,12 +88,15 @@ func (p *Pool) killWorker() bool {
 var errPoolNotRunning = errors.New("pool is not running")
 
 func (p *Pool) Submit(task Task) error {
+	p.lock.RLock()
 	p.submitWG.Add(1)
 	defer p.submitWG.Done()
 
-	if p.stopCalled.Load() {
+	if p.stopCalled {
+		p.lock.RUnlock()
 		return errPoolNotRunning
 	}
+	p.lock.RUnlock()
 
 	select {
 	case p.taskCh <- task:
@@ -104,12 +109,15 @@ func (p *Pool) Submit(task Task) error {
 var errQueueFull = errors.New("task queue is full")
 
 func (p *Pool) TrySubmit(task Task) error {
+	p.lock.RLock()
 	p.submitWG.Add(1)
 	defer p.submitWG.Done()
 
-	if p.stopCalled.Load() {
+	if p.stopCalled {
+		p.lock.RUnlock()
 		return errPoolNotRunning
 	}
+	p.lock.RUnlock()
 
 	select {
 	case p.taskCh <- task:
@@ -122,12 +130,17 @@ func (p *Pool) TrySubmit(task Task) error {
 }
 
 func (p *Pool) Stop() error {
-	if !p.stopCalled.CompareAndSwap(false, true) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if p.stopCalled {
 		return errPoolNotRunning
 	}
+	p.stopCalled = true
 	close(p.shutdownCh)
 
 	p.submitWG.Wait()
+
 	close(p.taskCh)
 	p.taskCh = nil
 
@@ -146,10 +159,12 @@ func (p *Pool) SetWorkersCount(count int) error {
 		return errors.New("workers count must be non-negative")
 	}
 
+	p.lock.Lock()
 	p.submitWG.Add(1)
 	defer p.submitWG.Done()
+	defer p.lock.Unlock()
 
-	if p.stopCalled.Load() {
+	if p.stopCalled {
 		return errPoolNotRunning
 	}
 
@@ -164,7 +179,7 @@ func (p *Pool) SetWorkersCount(count int) error {
 	if delta < 0 {
 		go func(pl *Pool, d int) {
 			for d < 0 {
-				if pl.killWorker() {
+				if !pl.killWorker() {
 					return
 				}
 				d++
