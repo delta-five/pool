@@ -15,9 +15,10 @@ type Pool struct {
 	workersCount  int
 	taskCh        chan Task
 	statistic     poolStatisticHolder
-	wg            sync.WaitGroup
+	workersWG     sync.WaitGroup
+	submitWG      sync.WaitGroup
 	lock          sync.RWMutex
-	stopCalled    bool
+	stopCalled    atomic.Bool
 }
 
 type poolStatisticHolder struct {
@@ -26,7 +27,7 @@ type poolStatisticHolder struct {
 	panicsCount   atomic.Int64
 }
 
-type poolStatistic struct {
+type PoolStatistic struct {
 	TaskProcessed int64
 	WorkersActive int64
 	PanicsCount   int64
@@ -50,7 +51,7 @@ func NewPool(workersCount int, queueSize int) (*Pool, error) {
 
 	go func() {
 		<-pool.shutdownCh
-		pool.wg.Wait()
+		pool.workersWG.Wait()
 		close(pool.doneCh)
 	}()
 
@@ -63,18 +64,34 @@ func NewPool(workersCount int, queueSize int) (*Pool, error) {
 
 func (p *Pool) addWorker() {
 	w := makeWorker(p)
-	p.wg.Go(w.run)
+	p.workersWG.Go(w.run)
+}
+
+func (p *Pool) killWorker() bool {
+	p.submitWG.Add(1)
+	defer p.submitWG.Done()
+
+	if p.stopCalled.Load() {
+		return false
+	}
+
+	select {
+	case p.workerCloseCh <- struct{}{}:
+		return true
+	case <-p.shutdownCh:
+		return false
+	}
 }
 
 var errPoolNotRunning = errors.New("pool is not running")
 
 func (p *Pool) Submit(task Task) error {
-	p.lock.RLock()
-	if p.stopCalled {
-		p.lock.RUnlock()
+	p.submitWG.Add(1)
+	defer p.submitWG.Done()
+
+	if p.stopCalled.Load() {
 		return errPoolNotRunning
 	}
-	p.lock.RUnlock()
 
 	select {
 	case p.taskCh <- task:
@@ -87,12 +104,12 @@ func (p *Pool) Submit(task Task) error {
 var errQueueFull = errors.New("task queue is full")
 
 func (p *Pool) TrySubmit(task Task) error {
-	p.lock.RLock()
-	if p.stopCalled {
-		p.lock.RUnlock()
+	p.submitWG.Add(1)
+	defer p.submitWG.Done()
+
+	if p.stopCalled.Load() {
 		return errPoolNotRunning
 	}
-	p.lock.RUnlock()
 
 	select {
 	case p.taskCh <- task:
@@ -105,14 +122,12 @@ func (p *Pool) TrySubmit(task Task) error {
 }
 
 func (p *Pool) Stop() error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	if p.stopCalled {
+	if !p.stopCalled.CompareAndSwap(false, true) {
 		return errPoolNotRunning
 	}
-	p.stopCalled = true
 	close(p.shutdownCh)
 
+	p.submitWG.Wait()
 	close(p.taskCh)
 	p.taskCh = nil
 
@@ -131,9 +146,10 @@ func (p *Pool) SetWorkersCount(count int) error {
 		return errors.New("workers count must be non-negative")
 	}
 
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	if p.stopCalled {
+	p.submitWG.Add(1)
+	defer p.submitWG.Done()
+
+	if p.stopCalled.Load() {
 		return errPoolNotRunning
 	}
 
@@ -148,15 +164,7 @@ func (p *Pool) SetWorkersCount(count int) error {
 	if delta < 0 {
 		go func(pl *Pool, d int) {
 			for d < 0 {
-				pl.lock.RLock()
-				if pl.stopCalled {
-					pl.lock.RUnlock()
-					return
-				}
-				pl.lock.RUnlock()
-				select {
-				case pl.workerCloseCh <- struct{}{}:
-				case <-pl.shutdownCh:
+				if pl.killWorker() {
 					return
 				}
 				d++
@@ -166,11 +174,11 @@ func (p *Pool) SetWorkersCount(count int) error {
 	return nil
 }
 
-func (p *Pool) Statistic() poolStatistic {
+func (p *Pool) Statistic() PoolStatistic {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
-	return poolStatistic{
+	return PoolStatistic{
 		TaskProcessed: p.statistic.taskProcessed.Load(),
 		WorkersActive: p.statistic.workersActive.Load(),
 		PanicsCount:   p.statistic.panicsCount.Load(),

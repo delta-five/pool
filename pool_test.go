@@ -208,7 +208,10 @@ func TestPool_SetWorkersCount_Decrease_LimitsConcurrency(t *testing.T) {
 	}
 	waitOrTimeout(t, &wg, 3*time.Second)
 
-	assert.LessOrEqual(t, maxConcurrent.Load(), int64(1))
+	assert.LessOrEqual(t, maxConcurrent.Load(), int64(1),
+		"known bug: SetWorkersCount's shrink goroutine returns after the first successful "+
+			"killWorker() call instead of looping until delta reaches 0, so shrinking by more "+
+			"than one worker at a time only actually stops one")
 }
 
 func TestPool_SetWorkersCount_RepeatedCallsDoNotDrift(t *testing.T) {
