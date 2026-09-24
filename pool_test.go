@@ -239,11 +239,42 @@ func TestPool_SetWorkersCount_RepeatedCallsDoNotDrift(t *testing.T) {
 	require.NoError(t, p.SetWorkersCount(4))
 	require.NoError(t, p.SetWorkersCount(4))
 
-	p.lock.RLock()
-	got := p.workersCount
-	p.lock.RUnlock()
+	assert.Equal(t, 4, p.WorkersCount())
+}
 
-	assert.Equal(t, 4, got)
+func TestPool_WorkersCount_ReflectsInitialValue(t *testing.T) {
+	p, err := NewPool(3, 1)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, p.WorkersCount())
+}
+
+func TestPool_WorkersCount_ZeroForFreshPoolWithoutWorkers(t *testing.T) {
+	p, err := NewPool(0, 1)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, p.WorkersCount())
+}
+
+func TestPool_WorkersCount_UpdatesImmediatelyOnIncrease(t *testing.T) {
+	p, err := NewPool(2, 1)
+	require.NoError(t, err)
+
+	require.NoError(t, p.SetWorkersCount(5))
+
+	assert.Equal(t, 5, p.WorkersCount())
+}
+
+func TestPool_WorkersCount_UpdatesImmediatelyOnDecrease(t *testing.T) {
+	// SetWorkersCount updates the count synchronously even though the actual
+	// shrink (signalling extra workers to stop) happens asynchronously in the
+	// background, so WorkersCount must reflect the new target right away.
+	p, err := NewPool(5, 1)
+	require.NoError(t, err)
+
+	require.NoError(t, p.SetWorkersCount(2))
+
+	assert.Equal(t, 2, p.WorkersCount())
 }
 
 func TestPool_Statistic_ReturnsZeroValueForFreshPool(t *testing.T) {

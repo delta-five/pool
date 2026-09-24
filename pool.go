@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 )
 
+// Task — функция, которую выполняет пул.
 type Task func()
 
 // Pool — пул воркеров для конкурентного выполнения задач.
@@ -29,10 +30,14 @@ type poolStatisticHolder struct {
 	panicsCount   atomic.Int64
 }
 
+// PoolStatistic — снимок счётчиков пула, возвращаемый Statistic.
 type PoolStatistic struct {
+	// TaskProcessed — число обработанных задач (успешно завершённых или с паникой).
 	TaskProcessed int64
+	// WorkersActive — число воркеров, выполняющих задачу прямо сейчас.
 	WorkersActive int64
-	PanicsCount   int64
+	// PanicsCount — число перехваченных паник внутри задач.
+	PanicsCount int64
 }
 
 // ErrInvalidWorkersCount возвращается NewPool и SetWorkersCount при отрицательном числе воркеров.
@@ -41,6 +46,9 @@ var ErrInvalidWorkersCount = errors.New("workers count must be non-negative")
 // ErrInvalidQueueSize возвращается NewPool при отрицательном размере очереди задач.
 var ErrInvalidQueueSize = errors.New("queue size must be non-negative")
 
+// NewPool создаёт пул с заданным числом воркеров и размером очереди задач.
+// workersCount и queueSize должны быть неотрицательными, иначе возвращается
+// ErrInvalidWorkersCount или ErrInvalidQueueSize.
 func NewPool(workersCount int, queueSize int) (*Pool, error) {
 	if workersCount < 0 {
 		return nil, ErrInvalidWorkersCount
@@ -97,6 +105,9 @@ func (p *Pool) killWorker() bool {
 // а также самим Stop при повторном вызове.
 var ErrPoolNotRunning = errors.New("pool is not running")
 
+// Submit отправляет задачу в очередь. Блокируется, если очередь заполнена,
+// до появления свободного места либо до остановки пула — в последнем случае
+// возвращает ErrPoolNotRunning.
 func (p *Pool) Submit(task Task) error {
 	p.lock.RLock()
 	p.submitWG.Add(1)
@@ -119,6 +130,9 @@ func (p *Pool) Submit(task Task) error {
 // ErrQueueFull возвращается TrySubmit, когда в очереди задач нет свободного места.
 var ErrQueueFull = errors.New("task queue is full")
 
+// TrySubmit отправляет задачу в очередь, не блокируясь: если очередь
+// заполнена, сразу возвращает ErrQueueFull. Если пул уже остановлен,
+// возвращает ErrPoolNotRunning.
 func (p *Pool) TrySubmit(task Task) error {
 	p.lock.RLock()
 	p.submitWG.Add(1)
@@ -140,6 +154,9 @@ func (p *Pool) TrySubmit(task Task) error {
 	}
 }
 
+// Stop останавливает пул: перестаёт принимать новые задачи и передаёт всем
+// воркерам сигнал завершения. Не ждёт завершения уже выполняющихся задач —
+// для этого используйте Done. Повторный вызов возвращает ErrPoolNotRunning.
 func (p *Pool) Stop() error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -161,10 +178,24 @@ func (p *Pool) Stop() error {
 	return nil
 }
 
+// Done возвращает канал, который закрывается, когда все воркеры полностью
+// завершили работу после Stop.
 func (p *Pool) Done() <-chan struct{} {
 	return p.doneCh
 }
 
+// WorkersCount возвращает текущее число воркеров пула.
+func (p *Pool) WorkersCount() int {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.workersCount
+}
+
+// SetWorkersCount изменяет число воркеров пула. Увеличение применяется
+// сразу; уменьшение — асинхронно, по мере того как воркеры освобождаются от
+// текущей задачи (метод не ждёт этого завершения). Отрицательное count
+// возвращает ErrInvalidWorkersCount, вызов после остановки пула —
+// ErrPoolNotRunning.
 func (p *Pool) SetWorkersCount(count int) error {
 	if count < 0 {
 		return ErrInvalidWorkersCount
