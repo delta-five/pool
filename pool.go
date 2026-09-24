@@ -172,12 +172,12 @@ func (p *Pool) TrySubmit(task Task) error {
 
 // Stop останавливает пул: перестаёт принимать новые задачи и передаёт всем
 // воркерам сигнал завершения. Сама по себе не ждёт завершения уже
-// выполняющихся задач - для этого используйте Done. dropTasks решает судьбу
+// выполняющихся задач - для этого используйте Done. dropQueued решает судьбу
 // задач, которые к моменту вызова уже лежат в очереди, но ещё не начали
 // выполняться: false - воркеры дорабатывают их все, прежде чем завершиться;
 // true - они отбрасываются, воркеры завершаются, как только освобождаются от
 // текущей задачи. Повторный вызов возвращает ErrPoolNotRunning.
-func (p *Pool) Stop(dropTasks bool) error {
+func (p *Pool) Stop(dropQueued bool) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -189,7 +189,7 @@ func (p *Pool) Stop(dropTasks bool) error {
 
 	p.submitWG.Wait()
 
-	if dropTasks {
+	if dropQueued {
 		close(p.workerCloseCh)
 	}
 
