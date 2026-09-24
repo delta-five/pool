@@ -77,7 +77,7 @@ func TestPool_SetWorkersCount_ReturnsErrorAfterStop(t *testing.T) {
 	require.ErrorIs(t, p.SetWorkersCount(2), ErrPoolNotRunning)
 }
 
-func TestPool_Stop_DropTasksFalse_DrainsQueuedTasksBeforeExit(t *testing.T) {
+func TestPool_Stop_DropQueuedFalse_DrainsQueuedTasksBeforeExit(t *testing.T) {
 	// A single worker so the in-flight task blocks all queued tasks behind it
 	// until Stop is called, making the drain-vs-drop race deterministic.
 	p, err := NewPool(1, 10)
@@ -104,7 +104,7 @@ func TestPool_Stop_DropTasksFalse_DrainsQueuedTasksBeforeExit(t *testing.T) {
 	assert.Equal(t, int64(n), processed.Load())
 }
 
-func TestPool_Stop_DropTasksTrue_DropsQueuedTasks(t *testing.T) {
+func TestPool_Stop_DropQueuedTrue_DropsQueuedTasks(t *testing.T) {
 	p, err := NewPool(1, 10)
 	require.NoError(t, err)
 
@@ -128,7 +128,7 @@ func TestPool_Stop_DropTasksTrue_DropsQueuedTasks(t *testing.T) {
 	assert.Equal(t, int64(0), processed.Load())
 }
 
-func TestPool_Stop_DropTasksTrue_LetsInFlightTaskFinish(t *testing.T) {
+func TestPool_Stop_DropQueuedTrue_LetsInFlightTaskFinish(t *testing.T) {
 	p, err := NewPool(1, 1)
 	require.NoError(t, err)
 
@@ -159,7 +159,7 @@ func TestPool_Stop_DropTasksTrue_LetsInFlightTaskFinish(t *testing.T) {
 	assert.True(t, ran.Load())
 }
 
-func TestPool_Stop_SecondCallIgnoresDropTasksArgument(t *testing.T) {
+func TestPool_Stop_SecondCallIgnoresDropQueuedArgument(t *testing.T) {
 	p, err := NewPool(1, 1)
 	require.NoError(t, err)
 	require.NoError(t, p.Stop(false))
