@@ -5,7 +5,7 @@ import "sync/atomic"
 type worker struct {
 	workerCloseCh <-chan struct{}
 	taskCh        <-chan Task
-	statistic     *poolStatisticHolder
+	statistic     *statisticHolder
 	panicHandler  *atomic.Pointer[func(recovered any)]
 }
 

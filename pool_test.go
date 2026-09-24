@@ -339,3 +339,30 @@ func TestPool_Statistic_ReturnsZeroValueForFreshPool(t *testing.T) {
 	assert.Equal(t, int64(0), stat.TaskProcessed)
 	assert.Equal(t, int64(0), stat.PanicsCount)
 }
+
+func TestPool_Statistic_QueueLen(t *testing.T) {
+	t.Parallel()
+
+	const qSize = 10
+	p, err := NewPool(1, qSize)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, p.Statistic().QueueLen)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for range qSize {
+		err = p.Submit(func() {
+			<-ctx.Done()
+		})
+		require.NoError(t, err)
+	}
+
+	<-time.After(time.Second * 3)
+
+	stat := Statistic{
+		WorkersActive: 1,
+		QueueLen:      qSize - 1,
+	}
+	assert.Equal(t, stat, p.Statistic())
+}

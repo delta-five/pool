@@ -7,17 +7,17 @@ import (
 	"sync/atomic"
 )
 
-// Task — функция, которую выполняет пул.
+// Task - функция, которую выполняет пул.
 type Task func()
 
-// Pool — пул воркеров для конкурентного выполнения задач.
+// Pool - пул воркеров для конкурентного выполнения задач.
 type Pool struct {
 	shutdownCh    chan struct{}
 	doneCh        chan struct{}
 	workerCloseCh chan struct{}
 	workersCount  int
 	taskCh        chan Task
-	statistic     poolStatisticHolder
+	statistic     statisticHolder
 	panicHandler  atomic.Pointer[func(recovered any)]
 	workersWG     sync.WaitGroup
 	submitWG      sync.WaitGroup
@@ -25,20 +25,22 @@ type Pool struct {
 	stopCalled    bool
 }
 
-type poolStatisticHolder struct {
+type statisticHolder struct {
 	taskProcessed atomic.Int64
-	workersActive atomic.Int64
 	panicsCount   atomic.Int64
+	workersActive atomic.Int64
 }
 
-// PoolStatistic — снимок счётчиков пула, возвращаемый Statistic.
-type PoolStatistic struct {
-	// TaskProcessed — число обработанных задач (успешно завершённых или с паникой).
+// Statistic - снимок счётчиков пула, возвращаемый Statistic.
+type Statistic struct {
+	// TaskProcessed - число обработанных задач (успешно завершённых или с паникой).
 	TaskProcessed int64
-	// WorkersActive — число воркеров, выполняющих задачу прямо сейчас.
+	// WorkersActive - число воркеров, выполняющих задачу прямо сейчас.
 	WorkersActive int64
-	// PanicsCount — число перехваченных паник внутри задач.
+	// PanicsCount - число перехваченных паник внутри задач.
 	PanicsCount int64
+	// QueueLen - длина очереди задач
+	QueueLen int
 }
 
 // ErrInvalidWorkersCount возвращается NewPool и SetWorkersCount при отрицательном числе воркеров.
@@ -107,7 +109,7 @@ func (p *Pool) killWorker() bool {
 var ErrPoolNotRunning = errors.New("pool is not running")
 
 // Submit отправляет задачу в очередь. Блокируется, если очередь заполнена,
-// до появления свободного места либо до остановки пула — в последнем случае
+// до появления свободного места либо до остановки пула - в последнем случае
 // возвращает ErrPoolNotRunning.
 func (p *Pool) Submit(task Task) error {
 	return p.SubmitContext(context.Background(), task)
@@ -170,10 +172,10 @@ func (p *Pool) TrySubmit(task Task) error {
 
 // Stop останавливает пул: перестаёт принимать новые задачи и передаёт всем
 // воркерам сигнал завершения. Сама по себе не ждёт завершения уже
-// выполняющихся задач — для этого используйте Done. dropTasks решает судьбу
+// выполняющихся задач - для этого используйте Done. dropTasks решает судьбу
 // задач, которые к моменту вызова уже лежат в очереди, но ещё не начали
-// выполняться: false — воркеры дорабатывают их все, прежде чем завершиться;
-// true — они отбрасываются, воркеры завершаются, как только освобождаются от
+// выполняться: false - воркеры дорабатывают их все, прежде чем завершиться;
+// true - они отбрасываются, воркеры завершаются, как только освобождаются от
 // текущей задачи. Повторный вызов возвращает ErrPoolNotRunning.
 func (p *Pool) Stop(dropTasks bool) error {
 	p.lock.Lock()
@@ -211,9 +213,9 @@ func (p *Pool) WorkersCount() int {
 }
 
 // SetWorkersCount изменяет число воркеров пула. Увеличение применяется
-// сразу; уменьшение — асинхронно, по мере того как воркеры освобождаются от
+// сразу; уменьшение - асинхронно, по мере того как воркеры освобождаются от
 // текущей задачи (метод не ждёт этого завершения). Отрицательное count
-// возвращает ErrInvalidWorkersCount, вызов после остановки пула —
+// возвращает ErrInvalidWorkersCount, вызов после остановки пула -
 // ErrPoolNotRunning.
 func (p *Pool) SetWorkersCount(count int) error {
 	if count < 0 {
@@ -252,15 +254,16 @@ func (p *Pool) SetWorkersCount(count int) error {
 
 // Statistic возвращает снимок счётчиков пула. Вызов никогда не блокируется,
 // в том числе пока выполняется Stop.
-func (p *Pool) Statistic() PoolStatistic {
-	return PoolStatistic{
+func (p *Pool) Statistic() Statistic {
+	return Statistic{
 		TaskProcessed: p.statistic.taskProcessed.Load(),
 		WorkersActive: p.statistic.workersActive.Load(),
 		PanicsCount:   p.statistic.panicsCount.Load(),
+		QueueLen:      len(p.taskCh),
 	}
 }
 
-// OnPanic регистрирует колбэк, который вызывается при панике внутри задачи —
+// OnPanic регистрирует колбэк, который вызывается при панике внутри задачи -
 // в той же горутине, что выполняла задачу. Паника в любом случае
 // перехватывается автоматически, независимо от того, задан ли колбэк:
 // счётчик PanicsCount увеличивается, а пул продолжает работать. Колбэк нужен
