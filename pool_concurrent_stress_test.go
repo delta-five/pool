@@ -11,7 +11,7 @@ import (
 // p.submitWG.Add(1) in the same p.lock critical section that Stop() takes
 // (held for the whole of Stop(), including p.submitWG.Wait()), so an
 // in-flight call is always fully ordered before or fully ordered after
-// Stop() closes p.taskCh / p.workerCloseCh.
+// Stop() closes p.taskCh.
 //
 // Every goroutine below recovers its own panics so a hit doesn't crash the
 // whole test binary; a recovered panic is still reported via t.Errorf, so
@@ -52,7 +52,7 @@ func TestPool_ConcurrentSubmitAndTrySubmitVsStop(t *testing.T) {
 					t.Errorf("Stop panicked racing with Submit/TrySubmit: %v", r)
 				}
 			}()
-			_ = p.Stop()
+			_ = p.Stop(false)
 		}()
 		wg.Wait()
 	}
@@ -84,7 +84,7 @@ func TestPool_ConcurrentSetWorkersCountVsStop(t *testing.T) {
 					t.Errorf("Stop panicked racing with SetWorkersCount: %v", r)
 				}
 			}()
-			_ = p.Stop()
+			_ = p.Stop(false)
 		}()
 		wg.Wait()
 	}

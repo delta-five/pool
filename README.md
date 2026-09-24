@@ -12,7 +12,7 @@ go get github.com/delta-five/pool
 
 - Фиксированный пул воркеров с возможностью динамического изменения размера (`SetWorkersCount`)
 - Буферизированная очередь задач
-- Два режима отправки задачи: блокирующий (`Submit`) и неблокирующий (`TrySubmit`)
+- Три режима отправки задачи: блокирующий (`Submit`), с отменой по контексту (`SubmitContext`) и неблокирующий (`TrySubmit`)
 - Паники внутри задач автоматически перехватываются воркером — пул не падает; опционально наблюдаемы через `OnPanic`
 - Остановка пула через `Stop()` и ожидание полного завершения через `Done()`
 - Счётчики через `Statistic()`: обработанные задачи, активные воркеры, число пойманных паник
@@ -45,7 +45,7 @@ func main() {
 		}
 	}
 
-	if err := p.Stop(); err != nil {
+	if err := p.Stop(false); err != nil {
 		fmt.Println("stop:", err)
 	}
 	<-p.Done()
@@ -103,6 +103,22 @@ p.OnPanic(func(recovered any) {
 err := p.Submit(task)
 ```
 
+### SubmitContext — отправка с отменой по контексту
+
+`SubmitContext` ведёт себя как `Submit`, но дополнительно прерывает ожидание при отмене переданного контекста, возвращая `ctx.Err()`. Если контекст уже отменён к моменту вызова, `SubmitContext` не пытается отправить задачу и сразу возвращает эту ошибку:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+
+err := p.SubmitContext(ctx, task)
+if errors.Is(err, context.DeadlineExceeded) {
+	// не успели отправить задачу за секунду
+}
+```
+
+`Submit(task)` — это `SubmitContext(context.Background(), task)`.
+
 ### TrySubmit — неблокирующая отправка
 
 `TrySubmit` сразу возвращает `pool.ErrQueueFull`, если очередь заполнена, а не ждёт освобождения места:
@@ -150,19 +166,26 @@ fmt.Println("поймано паник:", stat.PanicsCount)
 ## Остановка пула
 
 ```go
-if err := p.Stop(); err != nil {
+if err := p.Stop(dropTasks); err != nil {
 	// пул уже был остановлен ранее
 }
 ```
 
-`Stop()` не принимает контекст или таймаут: он закрывает очередь задач и передаёт всем воркерам сигнал завершения сразу же. Повторный вызов `Stop()` возвращает `pool.ErrPoolNotRunning`. После остановки `Submit`, `TrySubmit` и `SetWorkersCount` также возвращают `pool.ErrPoolNotRunning`.
+`Stop` не принимает контекст или таймаут: он перестаёт принимать новые задачи и передаёт всем воркерам сигнал завершения сразу же. Сам вызов не ждёт завершения уже выполняющихся задач — для этого используйте `Done`.
+
+`dropTasks` решает судьбу задач, которые остались в очереди на момент вызова (уже отправленных через `Submit`/`TrySubmit`, но ещё не начатых):
+
+- `false` — воркеры дорабатывают все задачи из очереди, прежде чем завершиться;
+- `true` — оставшиеся в очереди задачи отбрасываются, воркеры завершаются, как только освобождаются от текущей (уже начатой) задачи.
+
+Повторный вызов `Stop` возвращает `pool.ErrPoolNotRunning` независимо от переданного `dropTasks`. После остановки `Submit`, `SubmitContext`, `TrySubmit` и `SetWorkersCount` также возвращают `pool.ErrPoolNotRunning`.
 
 ### Done — ожидание завершения пула
 
 `Done` возвращает канал, который закрывается, когда все воркеры фактически завершили работу:
 
 ```go
-if err := p.Stop(); err != nil {
+if err := p.Stop(false); err != nil {
 	fmt.Println("stop:", err)
 }
 <-p.Done()
@@ -178,7 +201,7 @@ fmt.Println("пул полностью остановлен")
 | `pool.ErrInvalidWorkersCount` | `NewPool`/`SetWorkersCount` вызваны с отрицательным числом воркеров |
 | `pool.ErrInvalidQueueSize` | `NewPool` вызван с отрицательным размером очереди |
 | `pool.ErrQueueFull` | `TrySubmit` вызван, когда очередь заполнена |
-| `pool.ErrPoolNotRunning` | `Submit`/`TrySubmit`/`SetWorkersCount`/`Stop` вызваны после остановки пула |
+| `pool.ErrPoolNotRunning` | `Submit`/`SubmitContext`/`TrySubmit`/`SetWorkersCount`/`Stop` вызваны после остановки пула |
 
 ## Тесты
 

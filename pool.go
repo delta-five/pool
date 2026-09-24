@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -109,6 +110,17 @@ var ErrPoolNotRunning = errors.New("pool is not running")
 // до появления свободного места либо до остановки пула — в последнем случае
 // возвращает ErrPoolNotRunning.
 func (p *Pool) Submit(task Task) error {
+	return p.SubmitContext(context.Background(), task)
+}
+
+// SubmitContext отправляет задачу в очередь, как и Submit, но дополнительно
+// прерывает ожидание по отмене контекста, возвращая ctx.Err(). Если пул уже
+// остановлен, возвращает ErrPoolNotRunning.
+func (p *Pool) SubmitContext(ctx context.Context, task Task) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	p.lock.RLock()
 	p.submitWG.Add(1)
 	defer p.submitWG.Done()
@@ -124,6 +136,8 @@ func (p *Pool) Submit(task Task) error {
 		return nil
 	case <-p.shutdownCh:
 		return ErrPoolNotRunning
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -155,9 +169,13 @@ func (p *Pool) TrySubmit(task Task) error {
 }
 
 // Stop останавливает пул: перестаёт принимать новые задачи и передаёт всем
-// воркерам сигнал завершения. Не ждёт завершения уже выполняющихся задач —
-// для этого используйте Done. Повторный вызов возвращает ErrPoolNotRunning.
-func (p *Pool) Stop() error {
+// воркерам сигнал завершения. Сама по себе не ждёт завершения уже
+// выполняющихся задач — для этого используйте Done. dropTasks решает судьбу
+// задач, которые к моменту вызова уже лежат в очереди, но ещё не начали
+// выполняться: false — воркеры дорабатывают их все, прежде чем завершиться;
+// true — они отбрасываются, воркеры завершаются, как только освобождаются от
+// текущей задачи. Повторный вызов возвращает ErrPoolNotRunning.
+func (p *Pool) Stop(dropTasks bool) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -169,11 +187,12 @@ func (p *Pool) Stop() error {
 
 	p.submitWG.Wait()
 
+	if dropTasks {
+		close(p.workerCloseCh)
+	}
+
 	close(p.taskCh)
 	p.taskCh = nil
-
-	close(p.workerCloseCh)
-	p.workerCloseCh = nil
 
 	return nil
 }

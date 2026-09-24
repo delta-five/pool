@@ -23,6 +23,12 @@ func (w worker) run() {
 		select {
 		case <-w.workerCloseCh:
 			return
+		default:
+		}
+
+		select {
+		case <-w.workerCloseCh:
+			return
 		case task, ok := <-w.taskCh:
 			if !ok {
 				return
