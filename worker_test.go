@@ -41,6 +41,38 @@ func TestWorker_DoTask_PanicIsRecovered(t *testing.T) {
 	assert.Equal(t, int64(1), pool.statistic.taskProcessed.Load())
 }
 
+func TestWorker_DoTask_InvokesOnPanicHandler(t *testing.T) {
+	pool := &Pool{}
+	var got any
+	pool.OnPanic(func(recovered any) { got = recovered })
+	w := makeWorker(pool)
+
+	w.doTask(func() { panic("boom") })
+
+	assert.Equal(t, "boom", got)
+}
+
+func TestWorker_DoTask_NilHandlerClearsIt(t *testing.T) {
+	pool := &Pool{}
+	pool.OnPanic(func(recovered any) { t.Fatal("handler should have been cleared") })
+	pool.OnPanic(nil)
+	w := makeWorker(pool)
+
+	require.NotPanics(t, func() {
+		w.doTask(func() { panic("boom") })
+	})
+	assert.Equal(t, int64(1), pool.statistic.panicsCount.Load())
+}
+
+func TestWorker_DoTask_NoHandlerSetDoesNotPanic(t *testing.T) {
+	pool := &Pool{}
+	w := makeWorker(pool)
+
+	require.NotPanics(t, func() {
+		w.doTask(func() { panic("boom") })
+	})
+}
+
 func TestWorker_DoTask_SurvivesPanicAndProcessesNextTask(t *testing.T) {
 	pool := &Pool{}
 	w := makeWorker(pool)

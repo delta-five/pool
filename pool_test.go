@@ -26,13 +26,13 @@ func waitOrTimeout(t *testing.T, wg *sync.WaitGroup, d time.Duration) {
 
 func TestNewPool_RejectsNegativeWorkersCount(t *testing.T) {
 	p, err := NewPool(-1, 1)
-	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidWorkersCount)
 	assert.Nil(t, p)
 }
 
 func TestNewPool_RejectsNegativeQueueSize(t *testing.T) {
 	p, err := NewPool(1, -1)
-	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidQueueSize)
 	assert.Nil(t, p)
 }
 
@@ -107,7 +107,7 @@ func TestPool_TrySubmit_ReturnsErrQueueFullWhenFull(t *testing.T) {
 
 	err = p.TrySubmit(func() {})
 	require.Error(t, err)
-	assert.Same(t, errQueueFull, err)
+	assert.Same(t, ErrQueueFull, err)
 }
 
 func TestPool_Submit_PanicInTaskDoesNotStopWorker(t *testing.T) {
@@ -128,6 +128,27 @@ func TestPool_Submit_PanicInTaskDoesNotStopWorker(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return p.Statistic().PanicsCount == 1
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestPool_OnPanic_InvokesHandlerWithRecoveredValue(t *testing.T) {
+	p, err := NewPool(1, 1)
+	require.NoError(t, err)
+
+	var got atomic.Value
+	handled := make(chan struct{})
+	p.OnPanic(func(recovered any) {
+		got.Store(recovered)
+		close(handled)
+	})
+
+	require.NoError(t, p.Submit(func() { panic("boom") }))
+
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("OnPanic handler was not invoked in time")
+	}
+	assert.Equal(t, "boom", got.Load())
 }
 
 func TestPool_Statistic_TracksProcessedTasks(t *testing.T) {
@@ -162,7 +183,7 @@ func TestPool_SetWorkersCount_RejectsNegative(t *testing.T) {
 	p, err := NewPool(1, 1)
 	require.NoError(t, err)
 
-	require.Error(t, p.SetWorkersCount(-1))
+	require.ErrorIs(t, p.SetWorkersCount(-1), ErrInvalidWorkersCount)
 }
 
 func TestPool_SetWorkersCount_Increase_NewWorkersProcessQueuedTasks(t *testing.T) {

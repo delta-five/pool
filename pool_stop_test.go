@@ -18,7 +18,7 @@ func TestPool_Stop_SecondCallReturnsError(t *testing.T) {
 	p, err := NewPool(1, 1)
 	require.NoError(t, err)
 	require.NoError(t, p.Stop())
-	require.ErrorIs(t, p.Stop(), errPoolNotRunning)
+	require.ErrorIs(t, p.Stop(), ErrPoolNotRunning)
 }
 
 func TestPool_Stop_ClosesDoneChannelAfterWorkersFinish(t *testing.T) {
@@ -56,7 +56,7 @@ func TestPool_Submit_ReturnsErrorAfterStop(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, p.Stop())
 
-	require.ErrorIs(t, p.Submit(func() {}), errPoolNotRunning)
+	require.ErrorIs(t, p.Submit(func() {}), ErrPoolNotRunning)
 }
 
 func TestPool_TrySubmit_ReturnsErrorAfterStop(t *testing.T) {
@@ -64,7 +64,7 @@ func TestPool_TrySubmit_ReturnsErrorAfterStop(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, p.Stop())
 
-	require.ErrorIs(t, p.TrySubmit(func() {}), errPoolNotRunning)
+	require.ErrorIs(t, p.TrySubmit(func() {}), ErrPoolNotRunning)
 }
 
 func TestPool_SetWorkersCount_ReturnsErrorAfterStop(t *testing.T) {
@@ -72,5 +72,5 @@ func TestPool_SetWorkersCount_ReturnsErrorAfterStop(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, p.Stop())
 
-	require.ErrorIs(t, p.SetWorkersCount(2), errPoolNotRunning)
+	require.ErrorIs(t, p.SetWorkersCount(2), ErrPoolNotRunning)
 }

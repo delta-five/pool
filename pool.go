@@ -8,6 +8,7 @@ import (
 
 type Task func()
 
+// Pool — пул воркеров для конкурентного выполнения задач.
 type Pool struct {
 	shutdownCh    chan struct{}
 	doneCh        chan struct{}
@@ -15,6 +16,7 @@ type Pool struct {
 	workersCount  int
 	taskCh        chan Task
 	statistic     poolStatisticHolder
+	panicHandler  atomic.Pointer[func(recovered any)]
 	workersWG     sync.WaitGroup
 	submitWG      sync.WaitGroup
 	lock          sync.RWMutex
@@ -33,12 +35,18 @@ type PoolStatistic struct {
 	PanicsCount   int64
 }
 
+// ErrInvalidWorkersCount возвращается NewPool и SetWorkersCount при отрицательном числе воркеров.
+var ErrInvalidWorkersCount = errors.New("workers count must be non-negative")
+
+// ErrInvalidQueueSize возвращается NewPool при отрицательном размере очереди задач.
+var ErrInvalidQueueSize = errors.New("queue size must be non-negative")
+
 func NewPool(workersCount int, queueSize int) (*Pool, error) {
 	if workersCount < 0 {
-		return nil, errors.New("workers count must be non-negative")
+		return nil, ErrInvalidWorkersCount
 	}
 	if queueSize < 0 {
-		return nil, errors.New("queue size must be non-negative")
+		return nil, ErrInvalidQueueSize
 	}
 
 	pool := &Pool{
@@ -85,7 +93,9 @@ func (p *Pool) killWorker() bool {
 	}
 }
 
-var errPoolNotRunning = errors.New("pool is not running")
+// ErrPoolNotRunning возвращается Submit, TrySubmit и SetWorkersCount после остановки пула,
+// а также самим Stop при повторном вызове.
+var ErrPoolNotRunning = errors.New("pool is not running")
 
 func (p *Pool) Submit(task Task) error {
 	p.lock.RLock()
@@ -94,7 +104,7 @@ func (p *Pool) Submit(task Task) error {
 
 	if p.stopCalled {
 		p.lock.RUnlock()
-		return errPoolNotRunning
+		return ErrPoolNotRunning
 	}
 	p.lock.RUnlock()
 
@@ -102,11 +112,12 @@ func (p *Pool) Submit(task Task) error {
 	case p.taskCh <- task:
 		return nil
 	case <-p.shutdownCh:
-		return errPoolNotRunning
+		return ErrPoolNotRunning
 	}
 }
 
-var errQueueFull = errors.New("task queue is full")
+// ErrQueueFull возвращается TrySubmit, когда в очереди задач нет свободного места.
+var ErrQueueFull = errors.New("task queue is full")
 
 func (p *Pool) TrySubmit(task Task) error {
 	p.lock.RLock()
@@ -115,7 +126,7 @@ func (p *Pool) TrySubmit(task Task) error {
 
 	if p.stopCalled {
 		p.lock.RUnlock()
-		return errPoolNotRunning
+		return ErrPoolNotRunning
 	}
 	p.lock.RUnlock()
 
@@ -123,9 +134,9 @@ func (p *Pool) TrySubmit(task Task) error {
 	case p.taskCh <- task:
 		return nil
 	case <-p.shutdownCh:
-		return errPoolNotRunning
+		return ErrPoolNotRunning
 	default:
-		return errQueueFull
+		return ErrQueueFull
 	}
 }
 
@@ -134,7 +145,7 @@ func (p *Pool) Stop() error {
 	defer p.lock.Unlock()
 
 	if p.stopCalled {
-		return errPoolNotRunning
+		return ErrPoolNotRunning
 	}
 	p.stopCalled = true
 	close(p.shutdownCh)
@@ -156,7 +167,7 @@ func (p *Pool) Done() <-chan struct{} {
 
 func (p *Pool) SetWorkersCount(count int) error {
 	if count < 0 {
-		return errors.New("workers count must be non-negative")
+		return ErrInvalidWorkersCount
 	}
 
 	p.lock.Lock()
@@ -165,7 +176,7 @@ func (p *Pool) SetWorkersCount(count int) error {
 	defer p.lock.Unlock()
 
 	if p.stopCalled {
-		return errPoolNotRunning
+		return ErrPoolNotRunning
 	}
 
 	delta := count - p.workersCount
@@ -189,13 +200,29 @@ func (p *Pool) SetWorkersCount(count int) error {
 	return nil
 }
 
+// Statistic возвращает снимок счётчиков пула. Вызов никогда не блокируется,
+// в том числе пока выполняется Stop.
 func (p *Pool) Statistic() PoolStatistic {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-
 	return PoolStatistic{
 		TaskProcessed: p.statistic.taskProcessed.Load(),
 		WorkersActive: p.statistic.workersActive.Load(),
 		PanicsCount:   p.statistic.panicsCount.Load(),
 	}
+}
+
+// OnPanic регистрирует колбэк, который вызывается при панике внутри задачи —
+// в той же горутине, что выполняла задачу. Паника в любом случае
+// перехватывается автоматически, независимо от того, задан ли колбэк:
+// счётчик PanicsCount увеличивается, а пул продолжает работать. Колбэк нужен
+// только для дополнительного наблюдения (например, логирования). nil снимает
+// колбэк.
+//
+// Сам колбэк не должен паниковать: паника внутри него распространится дальше
+// и приведёт к падению процесса.
+func (p *Pool) OnPanic(handler func(recovered any)) {
+	if handler == nil {
+		p.panicHandler.Store(nil)
+		return
+	}
+	p.panicHandler.Store(&handler)
 }
