@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -80,6 +81,59 @@ func TestPool_Submit_AllSubmittedTasksRun(t *testing.T) {
 	waitOrTimeout(t, &wg, 2*time.Second)
 	assert.Equal(t, int64(n), count.Load())
 	assert.Equal(t, int64(n), p.Statistic().TaskProcessed)
+}
+
+func TestPool_SubmitContext_RunsTask(t *testing.T) {
+	p, err := NewPool(2, 2)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	require.NoError(t, p.SubmitContext(context.Background(), func() { close(done) }))
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("task did not run in time")
+	}
+}
+
+func TestPool_SubmitContext_ReturnsCtxErrWhenAlreadyCanceled(t *testing.T) {
+	p, err := NewPool(1, 1)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, p.SubmitContext(ctx, func() {}), context.Canceled)
+}
+
+func TestPool_SubmitContext_ReturnsCtxErrWhenCanceledWhileBlocked(t *testing.T) {
+	// Zero workers: nothing drains the queue, so Submit blocks deterministically
+	// once the queue is full.
+	p, err := NewPool(0, 1)
+	require.NoError(t, err)
+	require.NoError(t, p.TrySubmit(func() {}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.SubmitContext(ctx, func() {}) }()
+
+	cancel()
+
+	select {
+	case submitErr := <-errCh:
+		require.ErrorIs(t, submitErr, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("SubmitContext did not return after context cancellation")
+	}
+}
+
+func TestPool_SubmitContext_ReturnsErrorAfterStop(t *testing.T) {
+	p, err := NewPool(1, 1)
+	require.NoError(t, err)
+	require.NoError(t, p.Stop(false))
+
+	require.ErrorIs(t, p.SubmitContext(context.Background(), func() {}), ErrPoolNotRunning)
 }
 
 func TestPool_TrySubmit_SucceedsWhenSpaceAvailable(t *testing.T) {
@@ -284,4 +338,31 @@ func TestPool_Statistic_ReturnsZeroValueForFreshPool(t *testing.T) {
 	stat := p.Statistic()
 	assert.Equal(t, int64(0), stat.TaskProcessed)
 	assert.Equal(t, int64(0), stat.PanicsCount)
+}
+
+func TestPool_Statistic_QueueLen(t *testing.T) {
+	t.Parallel()
+
+	const qSize = 10
+	p, err := NewPool(1, qSize)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, p.Statistic().QueueLen)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for range qSize {
+		err = p.Submit(func() {
+			<-ctx.Done()
+		})
+		require.NoError(t, err)
+	}
+
+	<-time.After(time.Second * 3)
+
+	stat := Statistic{
+		WorkersActive: 1,
+		QueueLen:      qSize - 1,
+	}
+	assert.Equal(t, stat, p.Statistic())
 }

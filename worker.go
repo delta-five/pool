@@ -5,7 +5,7 @@ import "sync/atomic"
 type worker struct {
 	workerCloseCh <-chan struct{}
 	taskCh        <-chan Task
-	statistic     *poolStatisticHolder
+	statistic     *statisticHolder
 	panicHandler  *atomic.Pointer[func(recovered any)]
 }
 
@@ -20,6 +20,12 @@ func makeWorker(pool *Pool) worker {
 
 func (w worker) run() {
 	for {
+		select {
+		case <-w.workerCloseCh:
+			return
+		default:
+		}
+
 		select {
 		case <-w.workerCloseCh:
 			return
