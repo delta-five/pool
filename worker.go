@@ -1,83 +1,50 @@
 package pool
 
-import (
-	"sync/atomic"
-)
+import "sync/atomic"
 
-// Состояния воркера.
-const (
-	workerStateNew             int32 = iota // воркер активен
-	workerStateStoppedGraceful              // воркер остановлен в режиме graceful
-	workerStateStoppedForced                // воркер остановлен принудительно
-)
-
-// worker — воркер пула, обрабатывающий задачи из общей очереди.
 type worker struct {
-	tasks               chan PoolTask
-	breaker             chan struct{}
-	state               atomic.Int32
-	doneTasksCount      *atomic.Int64
-	executingTasksCount *atomic.Int64
+	workerCloseCh <-chan struct{}
+	taskCh        <-chan Task
+	statistic     *poolStatisticHolder
+	panicHandler  *atomic.Pointer[func(recovered any)]
 }
 
-// newWorker создаёт воркера, разделяющего очередь задач и счётчики пула.
-func newWorker(
-	tasks chan PoolTask, executingTasksCount *atomic.Int64, doneTasksCount *atomic.Int64,
-) *worker {
-	w := &worker{
-		tasks:               tasks,
-		breaker:             make(chan struct{}),
-		doneTasksCount:      doneTasksCount,
-		executingTasksCount: executingTasksCount,
+func makeWorker(pool *Pool) worker {
+	return worker{
+		workerCloseCh: pool.workerCloseCh,
+		taskCh:        pool.taskCh,
+		statistic:     &pool.statistic,
+		panicHandler:  &pool.panicHandler,
 	}
-
-	return w
 }
 
-// run запускает цикл обработки задач.
-//
-// Воркер читает задачи из очереди и выполняет их, обновляя счётчики
-// выполняющихся и завершённых задач. Цикл завершается при остановке воркера
-// (через breaker) или при закрытии очереди задач.
-func (w *worker) run() {
+func (w worker) run() {
 	for {
-		if w.state.Load() != workerStateNew {
-			return
-		}
 		select {
-		case task, ok := <-w.tasks:
+		case <-w.workerCloseCh:
+			return
+		case task, ok := <-w.taskCh:
 			if !ok {
 				return
 			}
-			if w.state.Load() == workerStateStoppedForced { // не выполнять после запроса на останов
-				continue
-			}
-			func() {
-				w.executingTasksCount.Add(1)
-				defer w.doneTasksCount.Add(1)
-				defer w.executingTasksCount.Add(-1)
-				// panic recover и context checking по умолчанию crash-by-design,
-				// но могут быть включены через WithPanicHandler при отправке задачи.
-				task.Do()
-			}()
-		case <-w.breaker:
-			return
+			w.doTask(task)
 		}
 	}
 }
 
-// stop переводит воркера в состояние остановки.
-//
-// Если shutdownMode равно false, воркер останавливается в режиме graceful;
-// если true — принудительно. Повторный вызов игнорируется.
-func (w *worker) stop(shutdownMode bool) {
-	newState := workerStateStoppedGraceful
-	if shutdownMode {
-		newState = workerStateStoppedForced
-	}
+func (w worker) doTask(task Task) {
+	w.statistic.workersActive.Add(1)
+	defer func() {
+		r := recover()
+		if r != nil {
+			w.statistic.panicsCount.Add(1)
+			if h := w.panicHandler.Load(); h != nil {
+				(*h)(r)
+			}
+		}
+		w.statistic.taskProcessed.Add(1)
+		w.statistic.workersActive.Add(-1)
+	}()
 
-	if !w.state.CompareAndSwap(workerStateNew, newState) {
-		return
-	}
-	close(w.breaker)
+	task()
 }

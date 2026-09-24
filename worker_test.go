@@ -1,189 +1,169 @@
 package pool
 
 import (
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestWorker_run_ReturnsWhenAlreadyStopped(t *testing.T) {
-	t.Parallel()
+func TestWorker_DoTask_Success(t *testing.T) {
+	pool := &Pool{}
+	w := makeWorker(pool)
 
-	var executing, done atomic.Int64
-	w := newWorker(make(chan PoolTask, 1), &executing, &done)
-	w.state.Store(workerStateStoppedGraceful)
+	ran := false
+	w.doTask(func() { ran = true })
 
-	finished := make(chan struct{})
-	go func() {
-		w.run()
-		close(finished)
-	}()
-
-	select {
-	case <-finished:
-	case <-time.After(time.Second):
-		t.Fatal("run должен завершиться, если воркер уже остановлен")
-	}
+	assert.True(t, ran)
+	assert.Equal(t, int64(1), pool.statistic.taskProcessed.Load())
+	assert.Equal(t, int64(0), pool.statistic.panicsCount.Load())
 }
 
-func TestWorker_run_ReturnsOnClosedQueue(t *testing.T) {
-	t.Parallel()
+func TestWorker_DoTask_ActiveCounterReturnsToZero(t *testing.T) {
+	pool := &Pool{}
+	w := makeWorker(pool)
 
-	var executing, done atomic.Int64
-	tasks := make(chan PoolTask, 1)
-	w := newWorker(tasks, &executing, &done)
-	close(tasks)
+	w.doTask(func() {})
 
-	finished := make(chan struct{})
-	go func() {
-		w.run()
-		close(finished)
-	}()
-
-	select {
-	case <-finished:
-	case <-time.After(time.Second):
-		t.Fatal("run должен завершиться при закрытой очереди")
-	}
+	assert.Equal(t, int64(0), pool.statistic.workersActive.Load())
 }
 
-func TestWorker_run_ReturnsOnBreaker(t *testing.T) {
-	t.Parallel()
+func TestWorker_DoTask_PanicIsRecovered(t *testing.T) {
+	pool := &Pool{}
+	w := makeWorker(pool)
 
-	var executing, done atomic.Int64
-	tasks := make(chan PoolTask, 1)
-	w := newWorker(tasks, &executing, &done)
-	close(w.breaker)
-
-	finished := make(chan struct{})
-	go func() {
-		w.run()
-		close(finished)
-	}()
-
-	select {
-	case <-finished:
-	case <-time.After(time.Second):
-		t.Fatal("run должен завершиться при закрытом breaker")
-	}
-}
-
-func TestWorker_run_ExecutesTask(t *testing.T) {
-	t.Parallel()
-
-	var executing, done atomic.Int64
-	tasks := make(chan PoolTask, 1)
-	w := newWorker(tasks, &executing, &done)
-
-	executed := false
-	tasks <- MakeTask(1, func() { executed = true })
-	close(tasks)
-
-	finished := make(chan struct{})
-	go func() {
-		w.run()
-		close(finished)
-	}()
-
-	select {
-	case <-finished:
-	case <-time.After(time.Second):
-		t.Fatal("run должен завершиться")
-	}
-
-	require.True(t, executed)
-	require.Equal(t, int64(1), done.Load())
-	require.Equal(t, int64(0), executing.Load())
-}
-
-func TestWorker_run_SkipsTaskWhenStoppedForced(t *testing.T) {
-	t.Parallel()
-
-	var executing, done atomic.Int64
-	tasks := make(chan PoolTask, 1)
-	w := newWorker(tasks, &executing, &done)
-
-	finished := make(chan struct{})
-	go func() {
-		w.run()
-		close(finished)
-	}()
-
-	// Прогреваем воркер, чтобы он гарантированно оказался в цикле обработки.
-	tasks <- MakeTask("warmup", func() {})
-	require.Eventually(t, func() bool { return done.Load() == 1 }, time.Second, time.Millisecond)
-
-	// Даём воркеру гарантированно вернуться в select: после завершения
-	// warmup остаётся лишь пара атомарных операций до блокировки на select.
-	time.Sleep(time.Millisecond)
-
-	// Переводим воркер в forced без закрытия breaker и кладём задачу:
-	// select выберет задачу, а проверка состояния её пропустит.
-	w.state.Store(workerStateStoppedForced)
-	tasks <- MakeTask("dropped", func() { t.Error("задача не должна выполниться") })
-
-	select {
-	case <-finished:
-	case <-time.After(time.Second):
-		t.Fatal("run должен завершиться")
-	}
-
-	require.Equal(t, int64(1), done.Load())
-	require.Equal(t, int64(0), executing.Load())
-	require.Empty(t, tasks)
-}
-
-func TestWorker_stop(t *testing.T) {
-	t.Parallel()
-
-	t.Run("graceful", func(t *testing.T) {
-		t.Parallel()
-
-		var executing, done atomic.Int64
-		w := newWorker(make(chan PoolTask, 1), &executing, &done)
-
-		w.stop(false)
-
-		require.Equal(t, workerStateStoppedGraceful, w.state.Load())
-		select {
-		case <-w.breaker:
-		default:
-			t.Fatal("breaker должен быть закрыт")
-		}
+	require.NotPanics(t, func() {
+		w.doTask(func() { panic("boom") })
 	})
 
-	t.Run("forced", func(t *testing.T) {
-		t.Parallel()
+	assert.Equal(t, int64(1), pool.statistic.panicsCount.Load())
+	assert.Equal(t, int64(1), pool.statistic.taskProcessed.Load())
+}
 
-		var executing, done atomic.Int64
-		w := newWorker(make(chan PoolTask, 1), &executing, &done)
+func TestWorker_DoTask_InvokesOnPanicHandler(t *testing.T) {
+	pool := &Pool{}
+	var got any
+	pool.OnPanic(func(recovered any) { got = recovered })
+	w := makeWorker(pool)
 
-		w.stop(true)
+	w.doTask(func() { panic("boom") })
 
-		require.Equal(t, workerStateStoppedForced, w.state.Load())
-		select {
-		case <-w.breaker:
-		default:
-			t.Fatal("breaker должен быть закрыт")
-		}
+	assert.Equal(t, "boom", got)
+}
+
+func TestWorker_DoTask_NilHandlerClearsIt(t *testing.T) {
+	pool := &Pool{}
+	pool.OnPanic(func(recovered any) { t.Fatal("handler should have been cleared") })
+	pool.OnPanic(nil)
+	w := makeWorker(pool)
+
+	require.NotPanics(t, func() {
+		w.doTask(func() { panic("boom") })
 	})
+	assert.Equal(t, int64(1), pool.statistic.panicsCount.Load())
+}
 
-	t.Run("повторный вызов игнорируется", func(t *testing.T) {
-		t.Parallel()
+func TestWorker_DoTask_NoHandlerSetDoesNotPanic(t *testing.T) {
+	pool := &Pool{}
+	w := makeWorker(pool)
 
-		var executing, done atomic.Int64
-		w := newWorker(make(chan PoolTask, 1), &executing, &done)
-
-		w.state.Store(workerStateStoppedGraceful)
-		w.stop(false)
-
-		require.Equal(t, workerStateStoppedGraceful, w.state.Load())
-		select {
-		case <-w.breaker:
-			t.Fatal("breaker не должен быть закрыт при повторном вызове")
-		default:
-		}
+	require.NotPanics(t, func() {
+		w.doTask(func() { panic("boom") })
 	})
+}
+
+func TestWorker_DoTask_SurvivesPanicAndProcessesNextTask(t *testing.T) {
+	pool := &Pool{}
+	w := makeWorker(pool)
+
+	w.doTask(func() { panic("boom") })
+
+	ran := false
+	w.doTask(func() { ran = true })
+
+	assert.True(t, ran)
+	assert.Equal(t, int64(2), pool.statistic.taskProcessed.Load())
+	assert.Equal(t, int64(1), pool.statistic.panicsCount.Load())
+}
+
+func TestWorker_Run_ProcessesQueuedTasksAndExitsOnClose(t *testing.T) {
+	pool := &Pool{
+		taskCh:        make(chan Task, 2),
+		workerCloseCh: make(chan struct{}),
+	}
+	w := makeWorker(pool)
+
+	runDone := make(chan struct{})
+	go func() {
+		w.run()
+		close(runDone)
+	}()
+
+	results := make(chan int, 2)
+	pool.taskCh <- func() { results <- 1 }
+	pool.taskCh <- func() { results <- 2 }
+
+	got := map[int]bool{}
+	for range 2 {
+		select {
+		case v := <-results:
+			got[v] = true
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for task execution")
+		}
+	}
+	assert.True(t, got[1])
+	assert.True(t, got[2])
+	assert.Equal(t, int64(2), pool.statistic.taskProcessed.Load())
+
+	close(pool.workerCloseCh)
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for worker to exit after workerCloseCh was closed")
+	}
+}
+
+func TestWorker_Run_ExitsWhenTaskChannelIsClosed(t *testing.T) {
+	pool := &Pool{
+		taskCh:        make(chan Task),
+		workerCloseCh: make(chan struct{}),
+	}
+	w := makeWorker(pool)
+
+	runDone := make(chan struct{})
+	go func() {
+		w.run()
+		close(runDone)
+	}()
+
+	close(pool.taskCh)
+
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for worker to exit after taskCh was closed")
+	}
+}
+
+func TestWorker_Run_ExitsImmediatelyWhenAlreadyClosed(t *testing.T) {
+	pool := &Pool{
+		taskCh:        make(chan Task),
+		workerCloseCh: make(chan struct{}),
+	}
+	close(pool.workerCloseCh)
+	w := makeWorker(pool)
+
+	runDone := make(chan struct{})
+	go func() {
+		w.run()
+		close(runDone)
+	}()
+
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for worker to exit on an already-closed workerCloseCh")
+	}
 }

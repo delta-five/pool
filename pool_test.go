@@ -1,437 +1,287 @@
 package pool
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewPool_Validation(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		workers int
-		queue   int
-		wantErr error
-	}{
-		{"нулевое число воркеров", 0, 1, ErrWrongWorkersCount},
-		{"отрицательное число воркеров", -1, 1, ErrWrongWorkersCount},
-		{"нулевой размер очереди", 1, 0, ErrWrongTaskQueueSize},
-		{"отрицательный размер очереди", 1, -1, ErrWrongTaskQueueSize},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			p, err := NewPool(tt.workers, tt.queue)
-
-			require.Nil(t, p)
-			require.ErrorIs(t, err, tt.wantErr)
-		})
-	}
-}
-
-func TestNewPool_Success(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(4, 10)
-
-	require.NoError(t, err)
-	require.NotNil(t, p)
-	require.Equal(t, 4, p.Workers())
-	require.True(t, p.IsActive())
-	require.Equal(t, 0, p.DoneTasks())
-	require.Equal(t, 0, p.ExecutingTasks())
-
-	require.NoError(t, p.Shutdown(context.Background(), true))
-}
-
-func TestPool_Workers(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(2, 10)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, p.Shutdown(context.Background(), true)) })
-
-	require.Equal(t, 2, p.Workers())
-}
-
-func TestPool_SetWorkers(t *testing.T) {
-	t.Parallel()
-
-	t.Run("увеличение и уменьшение", func(t *testing.T) {
-		t.Parallel()
-
-		p, err := NewPool(2, 10)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, p.Shutdown(context.Background(), true)) })
-
-		require.NoError(t, p.SetWorkers(5))
-		require.Equal(t, 5, p.Workers())
-
-		require.NoError(t, p.SetWorkers(1))
-		require.Equal(t, 1, p.Workers())
-	})
-
-	t.Run("некорректное количество", func(t *testing.T) {
-		t.Parallel()
-
-		p, err := NewPool(2, 10)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, p.Shutdown(context.Background(), true)) })
-
-		require.ErrorIs(t, p.SetWorkers(0), ErrWrongWorkersCount)
-		require.ErrorIs(t, p.SetWorkers(-1), ErrWrongWorkersCount)
-	})
-
-	t.Run("после остановки пула", func(t *testing.T) {
-		t.Parallel()
-
-		p, err := NewPool(2, 10)
-		require.NoError(t, err)
-		require.NoError(t, p.Shutdown(context.Background(), true))
-
-		require.ErrorIs(t, p.SetWorkers(3), ErrPoolIsNotActive)
-	})
-}
-
-func TestPool_ExecutingTasks(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(1, 10)
-	require.NoError(t, err)
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	require.NoError(t, p.Submit(MakeTask(1, func() { close(started); <-release })))
-	<-started
-
-	require.Equal(t, 1, p.ExecutingTasks())
-	require.Equal(t, 0, p.DoneTasks())
-
-	close(release)
-	require.NoError(t, p.Shutdown(context.Background(), false))
-
-	require.Equal(t, 0, p.ExecutingTasks())
-	require.Equal(t, 1, p.DoneTasks())
-}
-
-func TestPool_DoneTasks(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(2, 10)
-	require.NoError(t, err)
-
-	for i := range 5 {
-		require.NoError(t, p.Submit(MakeTask(i, func() {})))
-	}
-
-	require.NoError(t, p.Shutdown(context.Background(), false))
-	require.Equal(t, 5, p.DoneTasks())
-}
-
-func TestPool_IsActive(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(1, 10)
-	require.NoError(t, err)
-	require.True(t, p.IsActive())
-
-	require.NoError(t, p.Shutdown(context.Background(), true))
-	require.False(t, p.IsActive())
-}
-
-func TestPool_Submit_ExecutesTasks(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(2, 10)
-	require.NoError(t, err)
-
-	const total = 5
-	var mu sync.Mutex
-	executed := make([]int, 0, total)
-
-	for i := range total {
-		n := i
-		require.NoError(t, p.Submit(MakeTask(n, func() {
-			mu.Lock()
-			executed = append(executed, n)
-			mu.Unlock()
-		})))
-	}
-
-	require.NoError(t, p.Shutdown(context.Background(), false))
-
-	require.Len(t, executed, total)
-	require.Equal(t, total, p.DoneTasks())
-	require.Equal(t, 0, p.ExecutingTasks())
-}
-
-func TestPool_Submit_NotActive(t *testing.T) {
-	t.Parallel()
-
-	p := &Pool{
-		tasksQueue:    make(chan PoolTask, 1),
-		submitBreaker: make(chan struct{}),
-	}
-	p.notActive.Store(true)
-
-	require.ErrorIs(t, p.Submit(MakeTask(1, func() {})), ErrPoolIsNotActive)
-}
-
-func TestPool_Submit_BreakerClosed(t *testing.T) {
-	t.Parallel()
-
-	p := &Pool{
-		tasksQueue:    make(chan PoolTask, 1),
-		submitBreaker: make(chan struct{}),
-	}
-	p.tasksQueue <- MakeTask(1, func() {})
-	close(p.submitBreaker)
-
-	require.ErrorIs(t, p.Submit(MakeTask(2, func() {})), ErrPoolIsNotActive)
-}
-
-func TestPool_TrySubmit(t *testing.T) {
-	t.Parallel()
-
-	t.Run("успешная отправка", func(t *testing.T) {
-		t.Parallel()
-
-		p, err := NewPool(1, 1)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, p.Shutdown(context.Background(), true)) })
-
-		require.NoError(t, p.TrySubmit(MakeTask(1, func() {})))
-	})
-
-	t.Run("очередь заполнена", func(t *testing.T) {
-		t.Parallel()
-
-		p := &Pool{
-			tasksQueue:    make(chan PoolTask, 1),
-			submitBreaker: make(chan struct{}),
-		}
-		p.tasksQueue <- MakeTask(1, func() {})
-
-		require.ErrorIs(t, p.TrySubmit(MakeTask(2, func() {})), ErrQueueFull)
-	})
-
-	t.Run("пул неактивен", func(t *testing.T) {
-		t.Parallel()
-
-		p := &Pool{
-			tasksQueue:    make(chan PoolTask, 1),
-			submitBreaker: make(chan struct{}),
-		}
-		p.notActive.Store(true)
-
-		require.ErrorIs(t, p.TrySubmit(MakeTask(1, func() {})), ErrPoolIsNotActive)
-	})
-
-	t.Run("breaker закрыт при заполненной очереди", func(t *testing.T) {
-		t.Parallel()
-
-		p := &Pool{
-			tasksQueue:    make(chan PoolTask, 1),
-			submitBreaker: make(chan struct{}),
-		}
-		p.tasksQueue <- MakeTask(1, func() {})
-		close(p.submitBreaker)
-
-		require.ErrorIs(t, p.TrySubmit(MakeTask(2, func() {})), ErrPoolIsNotActive)
-	})
-}
-
-func TestPool_Submit_WithPanicHandler(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(1, 10)
-	require.NoError(t, err)
-
-	var mu sync.Mutex
-	var ids []any
-	var recovered []any
-
-	require.NoError(t, p.Submit(
-		MakeTask(42, func() { panic("boom") }),
-		WithPanicHandler(func(id any, r any) {
-			mu.Lock()
-			ids = append(ids, id)
-			recovered = append(recovered, r)
-			mu.Unlock()
-		}),
-	))
-
-	require.NoError(t, p.Shutdown(context.Background(), false))
-
-	require.Equal(t, []any{42}, ids)
-	require.Equal(t, []any{"boom"}, recovered)
-	require.Equal(t, 1, p.DoneTasks())
-}
-
-func TestPool_Shutdown_Graceful(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(2, 10)
-	require.NoError(t, err)
-
-	for i := range 5 {
-		require.NoError(t, p.Submit(MakeTask(i, func() {})))
-	}
-
-	require.NoError(t, p.Shutdown(context.Background(), false))
-	require.Equal(t, 5, p.DoneTasks())
-	require.False(t, p.IsActive())
-}
-
-func TestPool_Shutdown_Force(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(3, 10)
-	require.NoError(t, err)
-
-	require.NoError(t, p.Submit(MakeTask(1, func() {})))
-
-	require.NoError(t, p.Shutdown(context.Background(), true))
-	require.False(t, p.IsActive())
-}
-
-func TestPool_Shutdown_ForceDrainsQueue(t *testing.T) {
-	t.Parallel()
-
-	p := &Pool{
-		tasksQueue:    make(chan PoolTask, 3),
-		submitBreaker: make(chan struct{}),
-		workersDone:   make(chan struct{}),
-	}
-	p.tasksQueue <- MakeTask(1, func() {})
-	p.tasksQueue <- MakeTask(2, func() {})
-	p.tasksQueue <- MakeTask(3, func() {})
-
-	require.NoError(t, p.Shutdown(context.Background(), true))
-
-	require.Empty(t, p.tasksQueue)
-	select {
-	case <-p.workersDone:
-	default:
-		t.Fatal("workersDone должен быть закрыт после Shutdown")
-	}
-}
-
-func TestPool_Shutdown_AlreadyShutdown(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(1, 10)
-	require.NoError(t, err)
-
-	require.NoError(t, p.Shutdown(context.Background(), false))
-	require.ErrorIs(t, p.Shutdown(context.Background(), false), ErrAlreadyShutdown)
-}
-
-func TestPool_Shutdown_ContextCanceled(t *testing.T) {
-	t.Parallel()
-
-	t.Run("graceful", func(t *testing.T) {
-		t.Parallel()
-
-		p := &Pool{
-			tasksQueue:    make(chan PoolTask),
-			submitBreaker: make(chan struct{}),
-			workersDone:   make(chan struct{}),
-		}
-		p.workersWG.Add(1)
-		t.Cleanup(p.workersWG.Done)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		require.ErrorIs(t, p.Shutdown(ctx, false), context.Canceled)
-	})
-
-	t.Run("force", func(t *testing.T) {
-		t.Parallel()
-
-		p := &Pool{
-			tasksQueue:    make(chan PoolTask),
-			submitBreaker: make(chan struct{}),
-			workersDone:   make(chan struct{}),
-		}
-		p.submitWG.Add(1)
-		t.Cleanup(p.submitWG.Done)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		require.ErrorIs(t, p.Shutdown(ctx, true), context.Canceled)
-	})
-}
-
-func TestPool_Submit_AfterShutdown(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(1, 10)
-	require.NoError(t, err)
-	require.NoError(t, p.Shutdown(context.Background(), false))
-
-	require.ErrorIs(t, p.Submit(MakeTask(1, func() {})), ErrPoolIsNotActive)
-	require.ErrorIs(t, p.TrySubmit(MakeTask(1, func() {})), ErrPoolIsNotActive)
-}
-
-func TestPool_Done(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(2, 10)
-	require.NoError(t, err)
-
-	done := p.Done()
+func waitOrTimeout(t *testing.T, wg *sync.WaitGroup, d time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 	select {
 	case <-done:
-		t.Fatal("Done не должен быть закрыт до Shutdown")
-	default:
+	case <-time.After(d):
+		t.Fatal("timed out waiting for tasks to complete")
 	}
+}
 
-	require.NoError(t, p.Shutdown(context.Background(), false))
+func TestNewPool_RejectsNegativeWorkersCount(t *testing.T) {
+	p, err := NewPool(-1, 1)
+	require.ErrorIs(t, err, ErrInvalidWorkersCount)
+	assert.Nil(t, p)
+}
+
+func TestNewPool_RejectsNegativeQueueSize(t *testing.T) {
+	p, err := NewPool(1, -1)
+	require.ErrorIs(t, err, ErrInvalidQueueSize)
+	assert.Nil(t, p)
+}
+
+func TestNewPool_AcceptsZeroWorkersAndZeroQueue(t *testing.T) {
+	p, err := NewPool(0, 0)
+	require.NoError(t, err)
+	require.NotNil(t, p)
+}
+
+func TestNewPool_AcceptsPositiveValues(t *testing.T) {
+	p, err := NewPool(2, 4)
+	require.NoError(t, err)
+	require.NotNil(t, p)
+}
+
+func TestPool_Submit_RunsTask(t *testing.T) {
+	p, err := NewPool(2, 2)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	require.NoError(t, p.Submit(func() { close(done) }))
 
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Done должен закрыться после Shutdown")
+		t.Fatal("task did not run in time")
 	}
 }
 
-func TestPool_Shutdown_ForceDropsQueuedTasks(t *testing.T) {
-	t.Parallel()
-
-	p, err := NewPool(1, 10)
+func TestPool_Submit_AllSubmittedTasksRun(t *testing.T) {
+	p, err := NewPool(4, 10)
 	require.NoError(t, err)
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	require.NoError(t, p.Submit(MakeTask(1, func() { close(started); <-release })))
-	<-started
-
-	var executed atomic.Int64
-	for i := range 5 {
-		require.NoError(t, p.Submit(MakeTask(100+i, func() { executed.Add(1) })))
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	var count atomic.Int64
+	for range n {
+		require.NoError(t, p.Submit(func() {
+			count.Add(1)
+			wg.Done()
+		}))
 	}
 
-	shutdownDone := make(chan error, 1)
-	go func() { shutdownDone <- p.Shutdown(context.Background(), true) }()
+	waitOrTimeout(t, &wg, 2*time.Second)
+	assert.Equal(t, int64(n), count.Load())
+	assert.Equal(t, int64(n), p.Statistic().TaskProcessed)
+}
+
+func TestPool_TrySubmit_SucceedsWhenSpaceAvailable(t *testing.T) {
+	p, err := NewPool(1, 1)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	require.NoError(t, p.TrySubmit(func() { close(done) }))
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("task did not run in time")
+	}
+}
+
+func TestPool_TrySubmit_ReturnsErrQueueFullWhenFull(t *testing.T) {
+	// Zero workers: nothing drains the queue, so "full" is deterministic
+	// instead of racing against a live worker.
+	p, err := NewPool(0, 2)
+	require.NoError(t, err)
+
+	require.NoError(t, p.TrySubmit(func() {}))
+	require.NoError(t, p.TrySubmit(func() {}))
+
+	err = p.TrySubmit(func() {})
+	require.Error(t, err)
+	assert.Same(t, ErrQueueFull, err)
+}
+
+func TestPool_Submit_PanicInTaskDoesNotStopWorker(t *testing.T) {
+	p, err := NewPool(1, 2)
+	require.NoError(t, err)
+
+	require.NoError(t, p.Submit(func() { panic("boom") }))
+
+	done := make(chan struct{})
+	require.NoError(t, p.Submit(func() { close(done) }))
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not process the next task after recovering from a panic")
+	}
 
 	require.Eventually(t, func() bool {
-		return p.workers[0].state.Load() == workerStateStoppedForced
-	}, time.Second, time.Millisecond)
+		return p.Statistic().PanicsCount == 1
+	}, time.Second, 10*time.Millisecond)
+}
 
-	close(release)
-	require.NoError(t, <-shutdownDone)
+func TestPool_OnPanic_InvokesHandlerWithRecoveredValue(t *testing.T) {
+	p, err := NewPool(1, 1)
+	require.NoError(t, err)
 
-	require.Equal(t, int64(0), executed.Load())
-	require.Equal(t, 1, p.DoneTasks())
+	var got atomic.Value
+	handled := make(chan struct{})
+	p.OnPanic(func(recovered any) {
+		got.Store(recovered)
+		close(handled)
+	})
+
+	require.NoError(t, p.Submit(func() { panic("boom") }))
+
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("OnPanic handler was not invoked in time")
+	}
+	assert.Equal(t, "boom", got.Load())
+}
+
+func TestPool_Statistic_TracksProcessedTasks(t *testing.T) {
+	p, err := NewPool(1, 4)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	for range 3 {
+		require.NoError(t, p.Submit(func() { wg.Done() }))
+	}
+	waitOrTimeout(t, &wg, time.Second)
+
+	assert.Equal(t, int64(3), p.Statistic().TaskProcessed)
+}
+
+func TestPool_Statistic_WorkersActiveReturnsToZeroAfterCompletion(t *testing.T) {
+	p, err := NewPool(2, 4)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	require.NoError(t, p.Submit(func() { wg.Done() }))
+	waitOrTimeout(t, &wg, time.Second)
+
+	require.Eventually(t, func() bool {
+		return p.Statistic().WorkersActive == 0
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestPool_SetWorkersCount_RejectsNegative(t *testing.T) {
+	p, err := NewPool(1, 1)
+	require.NoError(t, err)
+
+	require.ErrorIs(t, p.SetWorkersCount(-1), ErrInvalidWorkersCount)
+}
+
+func TestPool_SetWorkersCount_Increase_NewWorkersProcessQueuedTasks(t *testing.T) {
+	p, err := NewPool(0, 10) // starts with no workers, nothing drains the queue yet.
+	require.NoError(t, err)
+
+	require.NoError(t, p.SetWorkersCount(2))
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	for range 4 {
+		require.NoError(t, p.Submit(func() { wg.Done() }))
+	}
+	waitOrTimeout(t, &wg, 2*time.Second)
+}
+
+func TestPool_SetWorkersCount_Decrease_LimitsConcurrency(t *testing.T) {
+	p, err := NewPool(4, 20)
+	require.NoError(t, err)
+
+	require.NoError(t, p.SetWorkersCount(1))
+	// Give the shrink goroutine time to hand out all its close signals before
+	// we start measuring concurrency.
+	time.Sleep(100 * time.Millisecond)
+
+	const n = 10
+	var wg sync.WaitGroup
+	wg.Add(n)
+	var current, maxConcurrent atomic.Int64
+	for range n {
+		require.NoError(t, p.Submit(func() {
+			c := current.Add(1)
+			for {
+				m := maxConcurrent.Load()
+				if c <= m || maxConcurrent.CompareAndSwap(m, c) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			current.Add(-1)
+			wg.Done()
+		}))
+	}
+	waitOrTimeout(t, &wg, 3*time.Second)
+
+	assert.LessOrEqual(t, maxConcurrent.Load(), int64(1))
+}
+
+func TestPool_SetWorkersCount_RepeatedCallsDoNotDrift(t *testing.T) {
+	p, err := NewPool(2, 1)
+	require.NoError(t, err)
+
+	require.NoError(t, p.SetWorkersCount(4))
+	require.NoError(t, p.SetWorkersCount(4))
+
+	assert.Equal(t, 4, p.WorkersCount())
+}
+
+func TestPool_WorkersCount_ReflectsInitialValue(t *testing.T) {
+	p, err := NewPool(3, 1)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, p.WorkersCount())
+}
+
+func TestPool_WorkersCount_ZeroForFreshPoolWithoutWorkers(t *testing.T) {
+	p, err := NewPool(0, 1)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, p.WorkersCount())
+}
+
+func TestPool_WorkersCount_UpdatesImmediatelyOnIncrease(t *testing.T) {
+	p, err := NewPool(2, 1)
+	require.NoError(t, err)
+
+	require.NoError(t, p.SetWorkersCount(5))
+
+	assert.Equal(t, 5, p.WorkersCount())
+}
+
+func TestPool_WorkersCount_UpdatesImmediatelyOnDecrease(t *testing.T) {
+	// SetWorkersCount updates the count synchronously even though the actual
+	// shrink (signalling extra workers to stop) happens asynchronously in the
+	// background, so WorkersCount must reflect the new target right away.
+	p, err := NewPool(5, 1)
+	require.NoError(t, err)
+
+	require.NoError(t, p.SetWorkersCount(2))
+
+	assert.Equal(t, 2, p.WorkersCount())
+}
+
+func TestPool_Statistic_ReturnsZeroValueForFreshPool(t *testing.T) {
+	p, err := NewPool(1, 1)
+	require.NoError(t, err)
+
+	stat := p.Statistic()
+	assert.Equal(t, int64(0), stat.TaskProcessed)
+	assert.Equal(t, int64(0), stat.PanicsCount)
 }
